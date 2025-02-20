@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    kompose.cmd: kompose convert --out k8s/
+    kompose.version: 1.35.0 (HEAD)
+  labels:
+    io.kompose.service: hive-metastore
+  name: hive-metastore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      io.kompose.service: hive-metastore
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        kompose.cmd: kompose convert --out k8s/
+        kompose.version: 1.35.0 (HEAD)
+      labels:
+        io.kompose.service: hive-metastore
+    spec:
+      containers:
+        - env:
+            - name: DATABASE_NAME
+              value: hive
+            - name: DATABASE_PASSWORD
+              value: hive
+            - name: DATABASE_USER
+              value: hive
+            - name: HIVE_LOGLEVEL
+              value: INFO
+            - name: POSTGRES_SQL_SERVICE_HOST
+              value: db
+            - name: POSTGRES_SQL_SERVICE_PORT
+              value: "5432"
+            - name: S3_ACCESS_KEY
+              value: kokuminioaccess
+            - name: S3_BUCKET_NAME
+              value: koku-bucket
+            - name: S3_BUCKET_PATH
+              value: data
+            - name: S3_ENDPOINT
+              value: http://koku-minio:9000
+            - name: S3_SECRET
+              value: kokuminiosecret
+          image: quay.io/redhat-services-prod/cost-mgmt-dev-tenant/ubi-hive:2f89bfb
+          name: hive-metastore
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          volumeMounts:
+            - mountPath: /opt/hive-metastore-bin/conf/metastore-site.xml
+              name: hive-metastore-cm0
+              subPath: metastore-site.xml
+      restartPolicy: Always
+      volumes:
+        - configMap:
+            items:
+              - key: metastore-site.xml
+                path: metastore-site.xml
+            name: hive-metastore-cm0
+          name: hive-metastore-cm0

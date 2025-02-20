@@ -1,5 +1,3 @@
-ARG TARGETARCH
-
 FROM registry.access.redhat.com/ubi9-minimal:latest AS base
 
 USER root
@@ -61,6 +59,8 @@ RUN ldconfig
 
 # No intermetiate steps for x86_64, but declare it so it can be used for the final image
 FROM --platform=amd64 base AS stage-amd64
+
+ARG TARGETARCH
 
 FROM stage-${TARGETARCH} AS final
 # PIPENV_DEV is set to true in the docker-compose allowing

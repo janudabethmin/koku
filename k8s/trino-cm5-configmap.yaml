@@ -1,0 +1,17 @@
+apiVersion: v1
+data:
+  postgres.properties: |
+    connector.name=postgresql
+    connection-url=jdbc:postgresql://${ENV:POSTGRES_SQL_SERVICE_HOST}:${ENV:POSTGRES_SQL_SERVICE_PORT}/${ENV:DATABASE_NAME}
+    connection-user=${ENV:DATABASE_USER}
+    connection-password=${ENV:DATABASE_PASSWORD}
+    postgresql.array-mapping=AS_ARRAY
+    insert.non-transactional-insert.enabled=true
+    write.batch-size=10000
+kind: ConfigMap
+metadata:
+  annotations:
+    use-subpath: "true"
+  labels:
+    io.kompose.service: trino
+  name: trino-cm5

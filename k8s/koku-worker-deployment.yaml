@@ -1,0 +1,246 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    kompose.cmd: kompose convert --out k8s/
+    kompose.version: 1.35.0 (HEAD)
+  labels:
+    io.kompose.service: koku-worker
+  name: koku-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      io.kompose.service: koku-worker
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        kompose.cmd: kompose convert --out k8s/
+        kompose.version: 1.35.0 (HEAD)
+      labels:
+        io.kompose.service: koku-worker
+    spec:
+      containers:
+        - command:
+            - python
+            - manage.py
+            - restart_celery
+          env:
+            - name: AUTO_DATA_INGEST
+              value: "True"
+            - name: AWS_SHARED_CREDENTIALS_FILE
+            - name: CELERY_LOG_LEVEL
+              value: INFO
+            - name: DATABASE_ENGINE
+              value: postgresql
+            - name: DATABASE_NAME
+              value: postgres
+            - name: DATABASE_PASSWORD
+              value: postgres
+            - name: DATABASE_SERVICE_NAME
+              value: POSTGRES_SQL
+            - name: DATABASE_USER
+              value: postgres
+            - name: DATA_DIR
+              value: /testing/data
+            - name: DEBUG_ATTACH
+              value: "False"
+            - name: DELAYED_TASK_POLLING_MINUTES
+              value: "5"
+            - name: DELAYED_TASK_TIME
+              value: "20"
+            - name: DEVELOPMENT
+              value: "True"
+            - name: DJANGO_LOG_LEVEL
+              value: INFO
+            - name: DJANGO_SETTINGS_MODULE
+              value: koku.settings
+            - name: ENABLE_HCS_DEBUG
+              value: "False"
+            - name: ENABLE_ROS_DEBUG
+              value: "False"
+            - name: ENABLE_SUBS_DEBUG
+              value: "False"
+            - name: ENABLE_SUBS_PROVIDER_TYPES
+            - name: ENHANCED_ORG_ADMIN
+              value: "True"
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+            - name: INITIAL_INGEST_NUM_MONTHS
+              value: "2"
+            - name: INITIAL_INGEST_OVERRIDE
+              value: "False"
+            - name: KOKU_LOG_LEVEL
+              value: DEBUG
+            - name: LARGE_PROCESSING_WAIT_TIMER
+              value: "7"
+            - name: MAX_CELERY_TASKS_PER_WORKER
+              value: "10"
+            - name: NOTIFICATION_CHECK_TIME
+              value: "24"
+            - name: OCI_CLI_KEY_FILE
+            - name: OCI_PYTHON_SDK_NO_SERVICE_IMPORTS
+              value: "True"
+            - name: OCI_SHARED_CREDENTIALS_FILE
+            - name: POLLING_BATCH_SIZE
+              value: "100"
+            - name: POLLING_TIMER
+              value: "60"
+            - name: POSTGRES_SQL_SERVICE_HOST
+              value: db
+            - name: POSTGRES_SQL_SERVICE_PORT
+              value: "5432"
+            - name: PROCESSING_WAIT_TIMER
+              value: "3"
+            - name: PROMETHEUS_MULTIPROC_DIR
+              value: /tmp
+            - name: PROMETHEUS_PUSHGATEWAY
+              value: pushgateway:9091
+            - name: REDIS_HOST
+              value: redis
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REPORT_PROCESSING_BATCH_SIZE
+              value: "100000"
+            - name: RETAIN_NUM_MONTHS
+              value: "4"
+            - name: S3_BUCKET_NAME
+              value: koku-bucket
+            - name: S3_ENDPOINT
+              value: http://koku-minio:9000
+            - name: SCHEMA_SUFFIX
+            - name: SOURCES_API_HOST
+              value: sources-server
+            - name: SOURCES_API_PORT
+              value: "3000"
+            - name: TAG_ENABLED_LIMIT
+              value: "200"
+            - name: TRINO_DATE_STEP
+              value: "31"
+            - name: TRINO_HOST
+              value: trino
+            - name: TRINO_PORT
+              value: "8080"
+            - name: TRINO_S3A_OR_S3
+              value: s3a
+            - name: UNLEASH_HOST
+              value: unleash
+            - name: UNLEASH_LOG_LEVEL
+              value: WARNING
+            - name: UNLEASH_PORT
+              value: "4242"
+            - name: UNLEASH_PREFIX
+              value: http
+            - name: UNLEASH_TOKEN
+            - name: VALIDATION_RANGE
+              value: "5"
+            - name: XL_REPORT_COUNT
+              value: "100"
+          image: koku_base
+          name: koku-worker
+          ports:
+            - containerPort: 9000
+              protocol: TCP
+            - containerPort: 5678
+              protocol: TCP
+          volumeMounts:
+            - mountPath: /koku/.unleash
+              name: koku-worker-cm1
+            - mountPath: /koku/db_functions
+              name: koku-worker-cm2
+            - mountPath: /koku/scripts
+              name: koku-worker-cm3
+            - mountPath: /tmp/local_container
+              name: koku-worker-cm5
+            - mountPath: /tmp/oci_local
+              name: koku-worker-cm6
+            - mountPath: /tmp/local_bucket
+              name: koku-worker-cm7
+            - mountPath: /tmp/local_bucket_0
+              name: koku-worker-cm8
+            - mountPath: /tmp/local_bucket_1
+              name: koku-worker-cm9
+            - mountPath: /tmp/local_bucket_2
+              name: koku-worker-cm10
+            - mountPath: /tmp/local_bucket_3
+              name: koku-worker-cm11
+            - mountPath: /tmp/local_bucket_4
+              name: koku-worker-cm12
+            - mountPath: /tmp/local_bucket_5
+              name: koku-worker-cm13
+            - mountPath: /var/tmp/masu/insights_local
+              name: koku-worker-cm14
+            - mountPath: /tmp/gcp_local_bucket
+              name: koku-worker-cm15
+            - mountPath: /tmp/gcp_local_bucket_0
+              name: koku-worker-cm16
+            - mountPath: /tmp/gcp_local_bucket_1
+              name: koku-worker-cm17
+            - mountPath: /tmp/gcp_local_bucket_2
+              name: koku-worker-cm18
+            - mountPath: /tmp/gcp_local_bucket_3
+              name: koku-worker-cm19
+            - mountPath: /etc/credentials
+              name: koku-worker-cm20
+          workingDir: /koku/koku
+      hostname: koku-worker-1
+      restartPolicy: Always
+      volumes:
+        - configMap:
+            name: koku-worker-cm1
+          name: koku-worker-cm1
+        - configMap:
+            name: koku-worker-cm2
+          name: koku-worker-cm2
+        - configMap:
+            name: koku-worker-cm3
+          name: koku-worker-cm3
+        - configMap:
+            name: koku-worker-cm5
+          name: koku-worker-cm5
+        - configMap:
+            name: koku-worker-cm6
+          name: koku-worker-cm6
+        - configMap:
+            name: koku-worker-cm7
+          name: koku-worker-cm7
+        - configMap:
+            name: koku-worker-cm8
+          name: koku-worker-cm8
+        - configMap:
+            name: koku-worker-cm9
+          name: koku-worker-cm9
+        - configMap:
+            name: koku-worker-cm10
+          name: koku-worker-cm10
+        - configMap:
+            name: koku-worker-cm11
+          name: koku-worker-cm11
+        - configMap:
+            name: koku-worker-cm12
+          name: koku-worker-cm12
+        - configMap:
+            name: koku-worker-cm13
+          name: koku-worker-cm13
+        - configMap:
+            name: koku-worker-cm14
+          name: koku-worker-cm14
+        - configMap:
+            name: koku-worker-cm15
+          name: koku-worker-cm15
+        - configMap:
+            name: koku-worker-cm16
+          name: koku-worker-cm16
+        - configMap:
+            name: koku-worker-cm17
+          name: koku-worker-cm17
+        - configMap:
+            name: koku-worker-cm18
+          name: koku-worker-cm18
+        - configMap:
+            name: koku-worker-cm19
+          name: koku-worker-cm19
+        - configMap:
+            name: koku-worker-cm20
+          name: koku-worker-cm20

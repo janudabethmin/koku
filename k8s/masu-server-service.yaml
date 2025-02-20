@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    kompose.cmd: kompose convert --out k8s/
+    kompose.version: 1.35.0 (HEAD)
+  labels:
+    io.kompose.service: masu-server
+  name: masu-server
+spec:
+  ports:
+    - name: "5042"
+      port: 5042
+      targetPort: 8000
+    - name: "5001"
+      port: 5001
+      targetPort: 9000
+  selector:
+    io.kompose.service: masu-server

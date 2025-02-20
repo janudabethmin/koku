@@ -1,0 +1,35 @@
+apiVersion: v1
+data:
+  .gitignore: |
+    # Ignore everything in this directory
+    *
+    # Except this file
+    !.gitignore
+  aws.example: |
+    [default]
+    aws_access_key_id=AWS_ACCESS_KEY_ID
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+  gcp.example: |
+    {
+        "type": "",
+        "project_id": "",
+        "private_key_id": "",
+        "private_key": "",
+        "client_email": "",
+        "client_id": "",
+        "auth_uri": "",
+        "token_uri": "",
+        "auth_provider_x509_cert_url": "",
+        "client_x509_cert_url": ""
+    }
+  oci.example: |
+    [DEFAULT]
+    user=ocid1.user.id
+    fingerprint=00000000000000000
+    tenancy=ocid1.tenancy.id
+  oci_key_file.pem.example: ""
+kind: ConfigMap
+metadata:
+  labels:
+    io.kompose.service: koku-server
+  name: koku-server-cm5

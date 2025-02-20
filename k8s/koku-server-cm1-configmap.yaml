@@ -1,0 +1,12 @@
+apiVersion: v1
+data:
+  flags.json: |
+    {
+        "version": 1,
+        "features": []
+    }
+kind: ConfigMap
+metadata:
+  labels:
+    io.kompose.service: koku-server
+  name: koku-server-cm1

@@ -8,12 +8,11 @@ services:
       args:
         GIT_COMMIT: ${GIT_COMMIT-local-dev}
         PIPENV_DEV: "True"
-        USER_ID: ${USER_ID:?}
+        USER_ID: ${USER_ID}
+        # USER_ID: ${USER_ID:?}
     command: "echo 'Base Image Should Not Run'"
     depends_on:
-      - db
       - redis
-      - unleash
 
   koku-server:
     container_name: koku_server
@@ -60,7 +59,7 @@ services:
       - UNLEASH_HOST=${UNLEASH_HOST-unleash}
       - UNLEASH_PREFIX=${UNLEASH_PREFIX-http}
       - UNLEASH_PORT=${UNLEASH_PORT-4242}
-      - UNLEASH_TOKEN=${UNLEASH_TOKEN:?}
+      - UNLEASH_TOKEN=${UNLEASH_TOKEN}
       - UNLEASH_LOG_LEVEL=${UNLEASH_LOG_LEVEL-WARNING}
       - QE_SCHEMA=${QE_SCHEMA}
       - ENHANCED_ORG_ADMIN=${ENHANCED_ORG_ADMIN-True}
@@ -127,7 +126,7 @@ services:
       - UNLEASH_HOST=${UNLEASH_HOST-unleash}
       - UNLEASH_PREFIX=${UNLEASH_PREFIX-http}
       - UNLEASH_PORT=${UNLEASH_PORT-4242}
-      - UNLEASH_TOKEN=${UNLEASH_TOKEN:?}
+      - UNLEASH_TOKEN=${UNLEASH_TOKEN}
       - UNLEASH_LOG_LEVEL=${UNLEASH_LOG_LEVEL-WARNING}
       - AWS_SHARED_CREDENTIALS_FILE=${AWS_SHARED_CREDENTIALS_FILE-}
       - GOOGLE_APPLICATION_CREDENTIALS=${GOOGLE_APPLICATION_CREDENTIALS-}
@@ -220,7 +219,7 @@ services:
       - UNLEASH_HOST=${UNLEASH_HOST-unleash}
       - UNLEASH_PREFIX=${UNLEASH_PREFIX-http}
       - UNLEASH_PORT=${UNLEASH_PORT-4242}
-      - UNLEASH_TOKEN=${UNLEASH_TOKEN:?}
+      - UNLEASH_TOKEN=${UNLEASH_TOKEN}
       - ENHANCED_ORG_ADMIN=${ENHANCED_ORG_ADMIN-True}
     ports:
       - 6001-6020:9000
@@ -277,10 +276,6 @@ services:
       - DATABASE_PASSWORD=${DATABASE_PASSWORD-hive}
     volumes:
       - ./dev/containers/hive-metastore/metastore-site.xml:/opt/hive-metastore-bin/conf/metastore-site.xml
-    depends_on:
-      - db
-      - minio
-      - create-parquet-bucket
 
   trino:
     container_name: trino

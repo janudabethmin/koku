@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  annotations:
+    kompose.cmd: kompose convert --out k8s/
+    kompose.version: 1.35.0 (HEAD)
+  labels:
+    io.kompose.service: koku-worker
+  name: koku-worker
+spec:
+  ports:
+    - name: "9000"
+      port: 9000
+      targetPort: 9000
+    - name: "5678"
+      port: 5678
+      targetPort: 5678
+  selector:
+    io.kompose.service: koku-worker

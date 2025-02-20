@@ -1,0 +1,1809 @@
+apiVersion: v1
+data:
+  app_needs_migrations_func.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+    -- Function public.app_needs_migrations(leaf_migrations, _verbose)
+    -- Returns bool: true = run migrations; false = migrations up-to-date
+    -- leaf_migrations (jsonb) = leaf migration names by app from the django code
+    --    Ex: '{<django-app>: <latest-leaf-migration-name>}'
+    -- Set _verbose to true to see notices raised during execution
+    DROP FUNCTION IF EXISTS public.migrations_complete(jsonb, boolean);
+
+    CREATE OR REPLACE FUNCTION public.migrations_complete(leaf_migrations jsonb, _verbose boolean DEFAULT false)
+    RETURNS boolean AS $BODY$
+    DECLARE
+        schema_rec record;
+        leaf_app_key text;
+        leaf_app_keys text[];
+        latest_migrations jsonb;
+        required_tables int := 0;
+        completed_migrations boolean := true;
+        exists_rec record;
+        chk_res boolean;
+    BEGIN
+        /*
+         * Verify that the necessary tables are present
+         */
+        SELECT count(*)
+          INTO required_tables
+          FROM pg_class c
+          JOIN pg_namespace n
+            ON n.oid = c.relnamespace
+         WHERE n.nspname = 'public'
+           AND c.relname in ('api_tenant', 'django_migrations');
+
+        /*
+         * If migrations have been run against public, then we expect to find both tables
+         */
+        IF required_tables != 2
+        THEN
+            IF _verbose
+            THEN
+                RAISE WARNING 'Schema "public" not initialized';
+            END IF;
+            RETURN false;
+        END IF;
+
+        /*
+         * setup app keys for processing
+         */
+        SELECT array_agg(k)
+          INTO leaf_app_keys
+          FROM jsonb_object_keys(leaf_migrations) k;
+
+        FOR schema_rec IN
+            SELECT nspname::text as schema_name
+            FROM pg_catalog.pg_namespace
+            WHERE nspname = 'public'
+                OR nspname = 'template0'
+                OR nspname LIKE 'acct%'
+             ORDER
+                BY case when nspname::text = 'public'
+                             then '0public'
+                        else nspname::text
+                   END::text
+        LOOP
+            /* Get the latest recorded migrations by app for this tenant schema */
+            IF _verbose
+            THEN
+                RAISE INFO 'Checking migration state in schema %', schema_rec.schema_name;
+            END IF;
+
+            /* Check for race condition if someone deletes a source, etc during processing */
+            EXECUTE 'SELECT EXISTS ( ' ||
+                                'SELECT c.oid ' ||
+                                  'FROM pg_class c ' ||
+                                  'JOIN pg_namespace n ' ||
+                                    'ON n.oid = c.relnamespace ' ||
+                                 'WHERE c.relname = ''django_migrations'' ' ||
+                                   'AND n.nspname = ' || quote_literal(schema_rec.schema_name) || ' ' ||
+                            ')::boolean as "objects_exist", ' ||
+                            'EXISTS ( ' ||
+                                'SELECT n.oid ' ||
+                                  'FROM pg_namespace n ' ||
+                                 'WHERE nspname = ' || quote_literal(schema_rec.schema_name) || ' ' ||
+                            ')::boolean as "schema_exists" '
+              INTO exists_rec;
+
+            CONTINUE WHEN (NOT exists_rec.schema_exists);
+
+            IF NOT exists_rec.objects_exist
+            THEN
+                RAISE WARNING '    %.django_migrations does not exist', schema_rec.schema_name;
+                completed_migrations = false;
+            ELSE
+                EXECUTE 'SELECT jsonb_object_agg(app, migration) ' ||
+                        'FROM ( ' ||
+                                'SELECT app, ' ||
+                                        'max(name) as "migration" ' ||
+                                'FROM ' || quote_ident(schema_rec.schema_name) || '.django_migrations ' ||
+                                'GROUP BY app ' ||
+                            ') AS x ;'
+                INTO latest_migrations;
+
+                /* Loop through leaf apps */
+                FOREACH leaf_app_key IN ARRAY leaf_app_keys
+                LOOP
+                    /* test that app exists or not */
+                    IF latest_migrations ? leaf_app_key
+                    THEN
+                        /* App exists! Test if the leaf migration name is greater than the last recorded migration for the app */
+                        chk_res = (leaf_migrations->>leaf_app_key > latest_migrations->>leaf_app_key)::boolean;
+                        IF _verbose
+                        THEN
+                            RAISE INFO '    checking %.% > %.% (%)',
+                                        leaf_app_key,
+                                        leaf_migrations->>leaf_app_key,
+                                        leaf_app_key,
+                                        latest_migrations->>leaf_app_key,
+                                        chk_res::text;
+                        END IF;
+                        IF chk_res
+                        THEN
+                            /* leaf ahead of last recorded. run migrations! */
+                            completed_migrations = false;
+                            IF _verbose
+                            THEN
+                                RAISE INFO '        Will run migrations.';
+                            END IF;
+                        END IF;
+                    ELSE
+                        /* App does not exist, run migrations! */
+                        IF _verbose
+                        THEN
+                            RAISE INFO '    app % missing from schema', leaf_app_key;
+                        END IF;
+                        completed_migrations = false;
+                    END IF;
+
+                    EXIT WHEN not completed_migrations;
+                END LOOP;
+            END IF;
+
+            /* Stop processing if we are going to run migrations */
+            EXIT WHEN not completed_migrations;
+        END LOOP;
+
+        IF _verbose
+        THEN
+            RAISE INFO 'Migration Check: App should%execute migrations.', case when completed_migrations then ' not ' else ' ' end::text;
+        END IF;
+
+        RETURN completed_migrations;
+    END;
+    $BODY$ LANGUAGE PLPGSQL;
+  array_subtract_func.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+    create or replace function public.array_subtract(
+        minuend anyarray, subtrahend anyarray, out difference anyarray
+    )
+    returns anyarray as
+    $$
+    begin
+        execute 'select array(select unnest($1) except select unnest($2))'
+          using minuend, subtrahend
+           into difference;
+    end;
+    $$ language plpgsql returns null on null input;
+  clone_schema.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+
+    DROP FUNCTION IF EXISTS public.clone_schema(text, text, boolean, boolean);
+    CREATE OR REPLACE FUNCTION public.clone_schema(
+        source_schema text,
+        dest_schema text,
+        copy_data boolean DEFAULT false,
+        _verbose boolean DEFAULT false
+    ) RETURNS boolean AS $$
+    DECLARE
+        sequence_owner_info jsonb[];
+        table_objects jsonb[];
+        fk_objects jsonb[];
+        view_objects jsonb[];
+        function_objects jsonb[];
+        trigger_objects jsonb[];
+        rule_objects jsonb[];
+        comment_objects jsonb[];
+        jobject jsonb;
+        src_schema text;
+        dst_schema text;
+        source_obj text;
+        dest_obj text;
+        ix_stmt text;
+    BEGIN
+        dst_schema = quote_ident(dest_schema);
+        src_schema = quote_ident(source_schema);
+
+        /* Check if source schema exists */
+        PERFORM oid
+           FROM pg_namespace
+          WHERE nspname = source_schema;
+        IF NOT FOUND
+        THEN
+            RAISE WARNING 'Source schema % does not exist.', src_schema;
+            RETURN false;
+        END IF;
+
+        /* Check if dest schema exists */
+        PERFORM oid
+           FROM pg_namespace
+          WHERE nspname = dest_schema;
+        IF FOUND
+        THEN
+            RAISE INFO 'Destination schema % already exists.', dst_schema;
+            RETURN false;
+        END IF;
+
+        SET LOCAL search_path = public;
+
+        /*
+         * Gather data for copy
+         */
+
+        /* Sequence owner info */
+        IF _verbose THEN
+            RAISE INFO 'Gathering sequence owner data from %...', source_schema;
+        END IF;
+
+        SELECT coalesce(array_agg(
+                   jsonb_build_object(
+                       'sequence_name', s.relname::text,
+                       'owner_object', o.relname::text,
+                       'owner_column', a.attname::text
+                   )
+               ), '{}'::jsonb[])
+          INTO sequence_owner_info
+          FROM pg_class s
+          JOIN pg_sequence ps
+            ON ps.seqrelid = s.oid
+          JOIN pg_depend d
+            ON d.objid = s.oid
+          JOIN pg_attribute a
+            ON a.attrelid = d.refobjid
+           AND a.attnum = d.refobjsubid
+          JOIN pg_class o
+            ON o.oid = d.refobjid
+         WHERE s.relkind = 'S'
+           AND o.relnamespace = source_schema::regnamespace
+           AND NOT o.relispartition;
+
+        IF _verbose THEN
+            RAISE INFO '    Got %s schema owner objects...', cardinality(sequence_owner_info);
+        END IF;
+
+        /* Table objects */
+        IF _verbose THEN
+            RAISE INFO 'Gathering table object data from %...', source_schema;
+        END IF;
+
+        SELECT coalesce(array_agg(
+                   jsonb_build_object(
+                       'obj_id', t.oid,
+                       'table_name', t.relname::text,
+                       'table_kind', t.relkind::text,
+                       'partition_type', CASE pt2.partstrat
+                                              WHEN 'h' THEN 'HASH'
+                                              WHEN 'l' THEN 'LIST'
+                                              WHEN 'r' THEN 'RANGE'
+                                              ELSE NULL
+                                         END::text,
+                       'partition_key', pk.attname::text,
+                       'is_partition', t.relispartition,
+                       'partitioned_table', p.relname,
+                       'partition_expr', pg_get_expr(t.relpartbound, t.oid)
+                  )
+                  ORDER BY t.relkind, t.relispartition
+               ), '{}'::jsonb[])
+          INTO table_objects
+          FROM pg_class t
+          LEFT
+          JOIN pg_inherits h
+            ON h.inhrelid = t.oid
+          LEFT
+          JOIN pg_partitioned_table pt
+            ON pt.partrelid = h.inhparent
+          LEFT
+          JOIN pg_class p
+            ON p.oid = pt.partrelid
+          LEFT
+          JOIN pg_partitioned_table pt2
+            ON pt2.partrelid = t.oid
+          LEFT
+          JOIN pg_attribute pk
+            ON pk.attrelid = t.oid
+           AND pk.attnum = pt2.partattrs::text::int2
+         WHERE t.relnamespace = source_schema::regnamespace
+           AND t.relkind in ('r', 'p');
+
+        IF _verbose THEN
+            RAISE INFO '    Got %s table objects...', cardinality(table_objects);
+        END IF;
+
+        /* Foreign Key objects */
+        IF _verbose THEN
+            RAISE INFO 'Gathering foreign key constraint data from %...', source_schema;
+        END IF;
+
+        SELECT coalesce(array_agg(
+                   jsonb_build_object(
+                       'table_name', rn.relname,
+                       'constraint_name', ct.conname,
+                       'alter_stmt', 'ALTER TABLE ' || dst_schema || '.' || quote_ident(rn.relname) ||
+                                         ' ADD CONSTRAINT ' || quote_ident(ct.conname) || ' ' ||
+                                         replace(pg_get_constraintdef(ct.oid), source_schema || '.', dst_schema || '.') ||
+                                         ' ;'
+                   )
+               ), '{}'::jsonb[])
+        INTO fk_objects
+        FROM pg_constraint ct
+        JOIN pg_class rn
+            ON rn.oid = ct.conrelid
+        WHERE connamespace = source_schema::regnamespace
+        AND rn.relkind in ('r', 'p')
+        AND NOT rn.relispartition
+        AND ct.contype = 'f';
+
+        IF _verbose THEN
+            RAISE INFO '    Got %s foreign key objects...', cardinality(fk_objects);
+        END IF;
+
+        /* View objects */
+        IF _verbose THEN
+            RAISE INFO 'Gathering view object data from %...', source_schema;
+        END IF;
+
+        WITH RECURSIVE view_deps as (
+        SELECT DISTINCT
+               0 as depth,
+               v.oid as view_oid,
+               v.relname::text as view_name,
+               v.relkind as view_kind,
+               v.oid as dep_obj_id,
+               v.relname::text as dep_obj_name,
+               v.relkind as deb_obj_kind
+          FROM pg_class v
+         WHERE v.relnamespace = source_schema::regnamespace
+           AND v.relkind IN ('v', 'm')
+           AND NOT EXISTS (
+                            SELECT 1 as x
+                              FROM pg_depend d
+                              JOIN pg_class c
+                                ON c.oid = d.objid
+                               AND c.relkind in ('m', 'v')
+                             WHERE d.refobjid = v.oid
+                          )
+         UNION
+        SELECT DISTINCT
+               rv.depth + 1 as "depth",
+               dv.oid as view_oid,
+               dv.relname as view_name,
+               dv.relkind as view_kind,
+               rv.view_oid as ref_view_oid,
+               rv.view_name as ref_view_name,
+               rv.view_kind as ref_view_kind
+          FROM pg_class dv
+          JOIN pg_depend pd
+            ON pd.objid = dv.oid
+          JOIN view_deps as rv
+            ON rv.view_oid = pd.refobjid
+         WHERE dv.relnamespace = source_schema::regnamespace
+           AND dv.relkind in ('m', 'v')
+        ),
+        base_view_def as (
+        SELECT *,
+               replace(pg_get_viewdef(view_oid), source_schema || '.', dst_schema || '.') as "view_def"
+          FROM view_deps
+        )
+        SELECT coalesce(array_agg(
+                   jsonb_build_object(
+                       'view_name', bvd.view_name,
+                       'depth', bvd.depth,
+                       'view_kind', CASE WHEN bvd.view_kind = 'm'
+                                              THEN 'MATERIALIZED VIEW'
+                                         ELSE 'VIEW'
+                                    END::text,
+                       'view_def', CASE WHEN bvd.view_kind = 'm'
+                                             THEN substr(bvd.view_def, 1, length(bvd.view_def) - 1) || ' WITH DATA;'
+                                        ELSE bvd.view_def
+                                   END::text,
+                       'view_indexes', COALESCE((SELECT to_jsonb(array_to_json(array_agg(replace(pg_get_indexdef(i.indexrelid),
+                                                                                         source_schema || '.',
+                                                                                         dst_schema || '.'))))
+                                                   FROM pg_index i
+                                                  WHERE i.indrelid = bvd.view_oid),
+                                                jsonb_build_array())
+                   )
+                   order by bvd.depth
+               ), '{}'::jsonb[])
+          INTO view_objects
+          FROM base_view_def bvd;
+
+        IF _verbose THEN
+            RAISE INFO '    Got %s view objects...', cardinality(view_objects);
+        END IF;
+
+        /* Function objects */
+        IF _verbose THEN
+            RAISE INFO 'Gathering function/procedure object data from %...', source_schema;
+        END IF;
+
+        SELECT coalesce(array_agg(
+                   jsonb_build_object(
+                       'func_name', proname,
+                       'func_type', CASE prokind
+                                         WHEN 'p' THEN 'PROCEDURE'
+                                         WHEN 'f' THEN 'FUNCTION'
+                                         WHEN 'a' THEN 'AGGREGATE'
+                                         WHEN 'w' THEN 'WINDOW'
+                                         ELSE 'UNKNOWN'
+                                    END::text,
+                       'func_stmt', replace(pg_get_functiondef(oid), source_schema || '.', dst_schema || '.')
+                   )
+               ), '{}'::jsonb[])
+        INTO function_objects
+        FROM pg_proc
+        WHERE pronamespace = source_schema::regnamespace;
+
+        IF _verbose THEN
+            RAISE INFO '    Got %s function/procedure objects...', cardinality(function_objects);
+        END IF;
+
+        /* Trigger objects */
+        IF _verbose THEN
+            RAISE INFO 'Gathering trigger object data from %...', source_schema;
+        END IF;
+
+        SELECT coalesce(array_agg(
+                   jsonb_build_object(
+                       'trigger_id', t.oid,
+                       'trigger_name', t.tgname::text,
+                       'table_name', c.relname::text,
+                       'trigger_def', replace(pg_get_triggerdef(t.oid), source_schema || '.', dst_schema || '.')
+                   )
+               ), '{}'::jsonb[])
+          INTO trigger_objects
+          FROM pg_trigger t
+          JOIN pg_class c
+            ON c.oid = t.tgrelid
+           AND NOT c.relispartition
+         WHERE c.relnamespace = source_schema::regnamespace
+           AND t.tgconstraint = 0;
+
+        IF _verbose THEN
+            RAISE INFO '    Got %s trigger objects...', cardinality(trigger_objects);
+        END IF;
+
+        /* Rule objects */
+        IF _verbose THEN
+            RAISE INFO 'Gathering rule object data from %...', source_schema;
+        END IF;
+
+        SELECT coalesce(array_agg(
+                   jsonb_build_object(
+                       'tablename', tablename,
+                       'rulename', rulename,
+                       'rule_def', replace(definition, source_schema || '.', dst_schema || '.')
+                   )
+               ), '{}'::jsonb[])
+        INTO rule_objects
+        FROM pg_rules
+        WHERE schemaname = source_schema;
+
+        IF _verbose THEN
+            RAISE INFO '    Got %s rule objects...', cardinality(rule_objects);
+        END IF;
+
+        /* Comment objects */
+        IF _verbose THEN
+            RAISE INFO 'Gathering object comment data from %...', source_schema;
+        END IF;
+
+        select coalesce(array_agg(
+                   jsonb_build_object(
+                       'oid', t.oid,
+                       'attnum', coalesce(c.attnum, -1),
+                       'relkind', t.relkind,
+                       'table_name', quote_ident(t.relname::text),
+                       'dot', case when c.attname is not null then '.' else '' end::text,
+                       'column_name', case when c.attname is not null then quote_ident(c.attname) else '' end::text,
+                       'comment_type', case when c.attname is null
+                                                 then case t.relkind
+                                                           when 'm' then 'MATERIALIZED VIEW'
+                                                           when 'v' then 'VIEW'
+                                                           else 'TABLE'
+                                                      end::text
+                                            else 'COLUMN'
+                                       end::text,
+                       'description', d.description
+                   )
+                   order by t.oid, coalesce(c.attnum, -1)
+               ), '{}'::jsonb[])
+          into comment_objects
+          from pg_description d
+          join pg_class t
+            on t.oid = d.objoid
+          left
+          join pg_attribute c
+            on c.attrelid = t.oid
+           and c.attnum = d.objsubid
+         where t.relnamespace = source_schema::regnamespace
+           and t.relkind = any('{r,p,v,m}'::text[]);
+
+        IF _verbose THEN
+            RAISE INFO '    Got %s comment objects...', cardinality(comment_objects);
+        END IF;
+
+        /*
+         * ======================================================================
+         */
+
+        /*
+         * Create the new schema
+         */
+        IF _verbose
+        THEN
+            RAISE INFO 'Creating schema %', dst_schema;
+        END IF;
+        EXECUTE 'CREATE SCHEMA ' || dst_schema || ' ;';
+
+        /*
+         * Create tables
+         */
+        IF cardinality(table_objects) > 0
+        THEN
+            IF _verbose
+            THEN
+                RAISE INFO 'Creating tables for %', dst_schema;
+            END IF;
+            FOREACH jobject IN ARRAY table_objects
+            LOOP
+                dest_obj = dst_schema || '.' || quote_ident(jobject->>'table_name'::text);
+                source_obj = src_schema || '.' || quote_ident(jobject->>'table_name'::text);
+
+                IF jobject->>'table_kind' = 'p'::text
+                THEN
+                    IF _verbose
+                    THEN
+                        RAISE INFO '    % (partitioned table)', dest_obj;
+                    END IF;
+                    EXECUTE FORMAT('CREATE TABLE IF NOT EXISTS %s (LIKE %s INCLUDING ALL) PARTITION BY %s ( %I ) ;',
+                                dest_obj,
+                                source_obj,
+                                jobject->>'partition_type'::text,
+                                jobject->>'partition_key'::text);
+                ELSIF (jobject->>'is_partition'::text):: boolean
+                THEN
+                    IF _verbose
+                    THEN
+                        RAISE INFO '    % (table partition)', dest_obj;
+                    END IF;
+                    EXECUTE FORMAT('CREATE TABLE IF NOT EXISTS %s PARTITION OF %s.%I %s ;',
+                                dest_obj,
+                                dst_schema,
+                                jobject->>'partitioned_table'::text,
+                                jobject->>'partition_expr'::text);
+                ELSE
+                    IF _verbose
+                    THEN
+                        RAISE INFO '    % (table)', dest_obj;
+                    END IF;
+                    EXECUTE FORMAT('CREATE TABLE IF NOT EXISTS %s (LIKE %s INCLUDING ALL) ;',
+                                dest_obj,
+                                source_obj);
+                END IF;
+
+                IF (copy_data OR
+                    (jobject->>'table_name' ~ 'partitioned_tables'::text) OR
+                    (jobject->>'table_name' ~ 'django_migrations'::text)) AND
+                (jobject->>'table_kind' = 'r'::text)
+                THEN
+                    IF _verbose
+                    THEN
+                        RAISE INFO '        Copying data...';
+                    END IF;
+                    EXECUTE FORMAT('INSERT INTO %s SELECT * FROM %s ;',
+                                dest_obj,
+                                source_obj);
+                END IF;
+
+                IF jobject->>'table_name' = 'partitioned_tables'::text
+                THEN
+                    IF _verbose
+                    THEN
+                        RAISE INFO '        Update partitioned_tables schema data';
+                    END IF;
+                    EXECUTE FORMAT('UPDATE %s SET schema_name = %L ;',
+                                dest_obj,
+                                dest_schema);
+                END IF;
+            END LOOP;
+        ELSE
+            IF _verbose
+            THEN
+                RAISE INFO 'No tables for %', dst_schema;
+            END IF;
+        END IF;
+
+        /*
+         * Set sequence value
+         */
+        IF cardinality(sequence_owner_info) > 0
+        THEN
+            IF _verbose
+            THEN
+                RAISE INFO 'Set current value for sequence objects in %', dst_schema;
+            END IF;
+            FOREACH jobject IN ARRAY sequence_owner_info
+            LOOP
+                IF _verbose
+                THEN
+                    RAISE INFO '    Update sequence value for %.%', dst_schema, quote_ident(jobject->>'owner_object'::text);
+                END IF;
+
+                EXECUTE FORMAT('SELECT setval(''%s.%I'', (SELECT max(%I) FROM %s.%I));',
+                            dst_schema,
+                            jobject->>'sequence_name'::text,
+                            jobject->>'owner_column'::text,
+                            dst_schema,
+                            jobject->>'owner_object'::text);
+            END LOOP;
+        ELSE
+            IF _verbose
+            THEN
+                RAISE INFO 'No sequence owner data for %', dst_schema;
+            END IF;
+        END IF;
+
+        /*
+         * Create Foreign Key Constraints
+         */
+        IF cardinality(fk_objects) > 0
+        THEN
+            IF _verbose
+            THEN
+                RAISE INFO 'Create foriegn key constraints for tables in "%"', dst_schema;
+            END IF;
+            FOREACH jobject IN ARRAY fk_objects
+            LOOP
+                IF _verbose
+                THEN
+                    RAISE INFO '    %.%', jobject->>'table_name', jobject->>'constraint_name'::text;
+                END IF;
+                EXECUTE jobject->>'alter_stmt'::text;
+            END LOOP;
+        ELSE
+            IF _verbose
+            THEN
+                RAISE INFO 'No foreign key constraints for %', dst_schema;
+            END IF;
+        END IF;
+
+        /*
+         * Create Views
+         */
+        IF cardinality(view_objects) > 0
+        THEN
+            IF _verbose
+            THEN
+                RAISE INFO 'Creating views for %', dst_schema;
+            END IF;
+            FOREACH jobject IN ARRAY view_objects
+            LOOP
+                IF _verbose
+                THEN
+                    RAISE INFO '    %: "%"', jobject->>'view_kind', jobject->>'view_name'::text;
+                END IF;
+                EXECUTE FORMAT('CREATE %s %s.%I AS %s',
+                            jobject->>'view_kind'::text,
+                            dst_schema,
+                            jobject->>'view_name'::text,
+                            jobject->>'view_def'::text);
+
+                IF jsonb_array_length(jobject->'view_indexes') > 0
+                THEN
+                    IF _verbose
+                    THEN
+                        RAISE INFO '        Create indexes';
+                    END IF;
+                    FOR ix_stmt IN select jsonb_array_elements_text(jobject->'view_indexes')
+                    LOOP
+                        EXECUTE ix_stmt;
+                    END LOOP;
+                END IF;
+            END LOOP;
+        ELSE
+            IF _verbose
+            THEN
+                RAISE INFO 'No view objects for %', dst_schema;
+            END IF;
+        END IF;
+
+        /*
+         * Create functions
+         */
+        IF cardinality(function_objects) > 0
+        THEN
+            IF _verbose
+            THEN
+                RAISE INFO 'Create functions, procedures for "%"', dst_schema;
+            END IF;
+            FOREACH jobject IN ARRAY function_objects
+            LOOP
+                IF _verbose
+                THEN
+                    RAISE INFO '    "%" "%"', jobject->>'func_type', jobject->>'func_name'::text;
+                END IF;
+                EXECUTE jobject->>'func_stmt'::text;
+            END LOOP;
+        ELSE
+            IF _verbose
+            THEN
+                RAISE INFO 'No function/procedure objects for %', dst_schema;
+            END IF;
+        END IF;
+
+        /*
+         * Create triggers
+         */
+        IF cardinality(trigger_objects) > 0
+        THEN
+            IF _verbose
+            THEN
+                RAISE INFO 'Create triggers on objects in "%"', dst_schema;
+            END IF;
+            FOREACH jobject IN ARRAY trigger_objects
+            LOOP
+                IF _verbose
+                THEN
+                    RAISE INFO '    "%"."%"', jobject->>'table_name', jobject->>'trigger_name'::text;
+                END IF;
+                EXECUTE jobject->>'trigger_def'::text;
+            END LOOP;
+        ELSE
+            IF _verbose
+            THEN
+                RAISE INFO 'No trigger objects for %', dst_schema;
+            END IF;
+        END IF;
+
+        /*
+         *  Create rules
+         */
+        IF cardinality(rule_objects) > 0
+        THEN
+            IF _verbose
+            THEN
+                RAISE INFO 'Creating rules on objects in %', dst_schema;
+            END IF;
+            FOREACH jobject IN ARRAY rule_objects
+            LOOP
+                IF _verbose
+                THEN
+                    RAISE INFO '    RULE "%" on "%"', jobject->>'rulename', jobject->>'tablename'::text;
+                END IF;
+                EXECUTE jobject->>'rule_def'::text;
+            END LOOP;
+        ELSE
+            IF _verbose
+            THEN
+                RAISE INFO 'No rule objects for %', dst_schema;
+            END IF;
+        END IF;
+
+        /*
+         * Create comments
+         */
+        IF cardinality(comment_objects) > 0
+        THEN
+            IF _verbose
+            THEN
+                RAISE INFO 'Creating comments on objects in %', dst_schema;
+            END IF;
+            FOREACH jobject IN ARRAY comment_objects
+            LOOP
+                IF _verbose AND ((jobject->>'attnum')::int = -1)
+                THEN
+                    RAISE INFO '    % % %', jobject->>'comment_type', jobject->>'table_name', jobject->>'column_name';
+                END IF;
+                EXECUTE FORMAT('COMMENT ON %s %s.%s%s%s IS %L ;',
+                            jobject->>'comment_type'::text,
+                            dst_schema,
+                            jobject->>'table_name',
+                            jobject->>'dot',
+                            jobject->>'column_name'::text,
+                            jobject->>'description'::text);
+            END LOOP;
+        ELSE
+            IF _verbose
+            THEN
+                RAISE INFO 'No comments on objects for %', dst_schema;
+            END IF;
+        END IF;
+
+        RETURN true;
+    END;
+    $$ LANGUAGE plpgsql;
+  create_date_partitions.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+    -- Procedure to create table partitions by scanning another table for partition key values.
+    -- Args:
+    --   check_table (text)      : Name of the table to check for partition start bounds
+    --   check_col (text)        : Name of the column that holds the date values to check
+    --   schema (text)           : Schema of the partitioned table
+    --   parttioned_table (text) : Name of the partitioned table within the schema
+    --   _commit (boolean)       : Execute a commit after action. (default is false)
+    DROP PROCEDURE IF EXISTS public.create_date_partitions(text, text, text, text, boolean);
+    CREATE OR REPLACE PROCEDURE public.create_date_partitions(
+        check_table text,
+        check_col text,
+        schema text,
+        partitioned_table text,
+        _commit boolean DEFAULT false
+    )
+    AS $$
+    DECLARE
+        rec record;
+        table_parts text[];
+        check_table_name text;
+        partition_name text  = '';
+        check_stmt text = '';
+    BEGIN
+        table_parts = string_to_array(check_table, '.');
+        IF ( cardinality(table_parts) > 1 )
+        THEN
+            check_table_name = quote_ident(table_parts[1]) || '.'::text || quote_ident(table_parts[2]);
+        ELSE
+            check_table_name = quote_ident(table_parts[1]);
+        END IF;
+
+        check_stmt = 'WITH distinct_date_key as (' ||
+                        'SELECT DISTINCT ' ||
+                        '       to_char(' || quote_ident(check_col) || ', ''YYYY-MM-01'')::text as date_key' ||
+                        '  FROM ' || check_table_name || ' ' ||
+                        ') ' ||
+                        'SELECT ddk.date_key::date' ||
+                        '  FROM distinct_date_key as ddk ' ||
+                        ' WHERE NOT EXISTS (SELECT 1 ' ||
+                        '                     FROM ' ||
+                                                quote_ident(schema) || '."partitioned_tables" ' ||
+                        '                    WHERE schema_name = ' || quote_literal(schema) ||
+                        '                      AND partition_of_table_name = ' || quote_literal(partitioned_table) ||
+                        '                      AND partition_type = ''range'' ' ||
+                        '                      AND ddk.date_key = (partition_parameters->>''from'') ) ;';
+        FOR rec IN EXECUTE check_stmt
+        LOOP
+            -- Create the new partition
+            partition_name = partitioned_table || '_' || to_char(rec.date_key, 'YYYY_MM');
+            CALL public.create_table_date_range_partition(
+                schema,
+                partition_name,
+                partitioned_table,
+                rec.date_key::date,
+                (rec.date_key::date + '1 month'::interval)::date
+            );
+            END LOOP;
+
+        IF (_commit = true) AND (partition_name != '')
+        THEN
+            COMMIT;
+        END IF;
+    END;
+    $$
+    LANGUAGE plpgsql;
+
+
+    -- Function to return table partition start bounds from scanning another table for partition key values.
+    -- Args:
+    --   check_table (text)      : Name of the table to check for partition start bounds
+    --   check_col (text)        : Name of the column that holds the date values to check
+    --   schema (text)           : Schema of the partitioned table
+    --   parttioned_table (text) : Name of the partitioned table within the schema
+    DROP FUNCTION IF EXISTS public.scan_for_date_partitions(text, text, text, text);
+    CREATE OR REPLACE FUNCTION public.scan_for_date_partitions(
+        check_table text,
+        check_col text,
+        schema text,
+        partitioned_table text
+    )
+    RETURNS TABLE (partition_start date)
+    AS $$
+    DECLARE
+        rec record;
+        table_parts text[];
+        check_table_name text;
+        partition_name text  = '';
+        check_stmt text = '';
+    BEGIN
+        table_parts = string_to_array(check_table, '.');
+        IF ( cardinality(table_parts) > 1 )
+        THEN
+            check_table_name = quote_ident(table_parts[1]) || '.'::text || quote_ident(table_parts[2]);
+        ELSE
+            check_table_name = quote_ident(table_parts[1]);
+        END IF;
+
+        check_stmt = 'WITH distinct_date_key as (' ||
+                        'SELECT DISTINCT ' ||
+                        '       date_trunc(''month'', ' || quote_ident(check_col) || ')::date as date_val,' ||
+                        '       to_char(' || quote_ident(check_col) || ', ''YYYY-MM-01'')::text as date_key' ||
+                        '  FROM ' || check_table_name || ' ' ||
+                        ') ' ||
+                        'SELECT ddk.date_val as partition_start ' ||
+                        '  FROM distinct_date_key as ddk ' ||
+                        ' WHERE NOT EXISTS (SELECT 1 ' ||
+                        '                     FROM ' ||
+                                                quote_ident(schema) || '."partitioned_tables" ' ||
+                        '                    WHERE schema_name = ' || quote_literal(schema) ||
+                        '                      AND partition_of_table_name = ' || quote_literal(partitioned_table) ||
+                        '                      AND partition_type = ''range'' ' ||
+                        '                      AND ddk.date_key = (partition_parameters->>''from'') ) ;';
+        RETURN QUERY EXECUTE check_stmt;
+    END;
+    $$
+    LANGUAGE plpgsql;
+  create_table_date_range_partition.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+    -- Procedure to create table partitions.
+    -- Depends on the partitioned_tables table being defined in each schema
+    -- Args:
+    --   check_table (text)      : Name of the table to check for partition start bounds
+    --   check_col (text)        : Name of the column that holds the date values to check
+    --   schema (text)           : Schema of the partitioned table
+    --   parttioned_table (text) : Name of the partitioned table within the schema
+    --   _commit (boolean)       : Execute a commit after action. (default is false)
+    DROP PROCEDURE IF EXISTS public.create_table_date_range_partition( text, text, text, date, date, boolean, boolean );
+    CREATE OR REPLACE PROCEDURE public.create_table_date_range_partition(
+        schema text,
+        table_partition text,
+        partitioned_table text,
+        date_from date,
+        date_to date,
+        _default boolean DEFAULT false,
+        _commit boolean DEFAULT false
+    ) AS $$
+    DECLARE
+        action_stmt text = '';
+        end_date date = null::date;
+    BEGIN
+        IF ( schema IS NULL OR schema = '' )
+        THEN
+            RAISE null_value_not_allowed
+                  USING MESSAGE = 'schema parameter cannot be null or empty string',
+                        HINT = 'Use a valid schema name.';
+        END IF;
+        IF ( table_partition IS NULL OR table_partition = '' )
+        THEN
+            RAISE null_value_not_allowed
+                  USING MESSAGE = 'table_partition parameter cannot be null or empty string',
+                        HINT = 'This must be a unique table name within the specified schema.';
+        END IF;
+        IF ( partitioned_table IS NULL OR partitioned_table = '' )
+        THEN
+            RAISE null_value_not_allowed
+                  USING MESSAGE = 'partitioned_table parameter cannot be null or empty string',
+                        HINT = 'This must be the name of a table within the specified schema that is a partitioned table.';
+        END IF;
+        if ( NOT _default )
+        THEN
+            IF ( date_from IS NULL )
+            THEN
+                RAISE null_value_not_allowed
+                    USING MESSAGE = 'date_from parameter cannot be null',
+                            HINT = 'This should be a valid date.';
+            END IF;
+            IF ( date_to IS NULL )
+            THEN
+                end_date = (date_from::date + '1 month'::interval)::date;
+            ELSE
+                end_date = date_to;
+            END IF;
+        END IF;
+
+        action_stmt = 'CREATE TABLE IF NOT EXISTS ' ||
+                        quote_ident(schema) || '.' || quote_ident(table_partition) ||
+                        ' PARTITION OF ' ||
+                        quote_ident(schema) || '.' || quote_ident(partitioned_table);
+        IF ( _default )
+        THEN
+            action_stmt = action_stmt ||
+                        ' DEFAULT ; ';
+        ELSE
+            action_stmt = action_stmt ||
+                        ' FOR VALUES FROM (' ||
+                        quote_literal(date_from) ||
+                        '::date) TO (' ||
+                        quote_literal(end_date) ||
+                        '::date); ';
+        END IF;
+        EXECUTE action_stmt;
+
+        -- log the new partition
+        action_stmt = 'INSERT INTO ' || quote_ident(schema) || '."partitioned_tables" ( ' ||
+                              '"schema_name", "table_name", "partition_of_table_name", ' ||
+                              '"partition_type", "partition_col", "partition_parameters" ' ||
+                      ') ' ||
+                      'SELECT ' || quote_literal(schema) || ', ' ||
+                                   quote_literal(table_partition) || ', ' ||
+                                   quote_literal(partitioned_table) || ', ' ||
+                                   '''range'', ' ||
+                                   'string_agg(a.attname, '',''), ' ||
+                                   'jsonb_build_object( ' ||
+                                       '''default'', false, ' ||
+                                       '''from'', ' || quote_literal(date_from::text) || ', ' ||
+                                       '''to'', ' || quote_literal(end_date::text) ||
+                                   ') ' ||
+                        'FROM pg_partitioned_table p ' ||
+                        'JOIN pg_attribute a ' ||
+                          'ON a.attrelid = p.partrelid ' ||
+                         'AND a.attnum = any(string_to_array(p.partattrs::text, '' '')::smallint[]) ' ||
+                       'WHERE p.partrelid = ' ||
+                              quote_literal(schema || '.'::text || partitioned_table) || '::regclass ' ||
+                          'ON CONFLICT (schema_name, table_name) DO NOTHING ;';
+        EXECUTE action_stmt;
+
+        IF ( _commit = true )
+        THEN
+            COMMIT;
+        END IF;
+    END;
+    $$
+    LANGUAGE plpgsql;
+  jsonb_sha256_text.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+
+    create or replace function public.jsonb_sha256_text(j_param jsonb, out hash_val text)
+    returns text
+    as $$
+    begin
+        select encode(sha256(decode(string_agg(key || ':' || value, '|'), 'escape')), 'hex')
+          from (
+                 select *
+                   from jsonb_each_text(j_param)
+                  order by key, value
+               ) as ordered_jsonb
+          into hash_val;
+    end;
+    $$ language plpgsql returns null on null input
+    immutable;
+  partitioned_manage_trigger.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+
+    DROP TRIGGER IF EXISTS tr_partition_manager ON partitioned_tables;
+    CREATE TRIGGER tr_partition_manager
+     AFTER INSERT
+        OR DELETE
+        OR UPDATE
+        ON partitioned_tables
+       FOR EACH ROW EXECUTE FUNCTION public.trfn_partition_manager();
+  partitioned_manager_trigger_function.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+
+    -- This **WILL** drop the associated trigger!
+    DROP FUNCTION IF EXISTS public.trfn_partition_manager() CASCADE;
+    CREATE OR REPLACE FUNCTION public.trfn_partition_manager() RETURNS TRIGGER AS $$
+    DECLARE
+        item text = '';
+        n_partition_type text = null;
+        action_stmt text = '';
+        action_stmt_2 text = '';
+        action_items text[] = '{}'::text[];
+        action_ix integer = 1;
+        total_actions integer = 0;
+        action_stmts text[] = '{}'::text[];
+        messages text[] = '{}'::text[];
+        message_text text = '';
+        col_type_name text = null;
+        partition_attached boolean = null;
+    BEGIN
+        /* Force any pending constraint work during the current transaction to fire immediately */
+        SET CONSTRAINTS ALL IMMEDIATE;
+
+        IF ( TG_OP = 'DELETE' )
+        THEN
+            EXECUTE format(
+    '
+    select c.oid
+      from pg_class c
+      join pg_namespace n
+        on n.oid = c.relnamespace
+     where n.nspname = %L
+       and c.relname = %L ;
+    ',
+                        OLD.schema_name,
+                        OLD.table_name
+                    )
+               INTO item;
+            IF item IS NOT NULL
+            THEN
+                IF ( OLD.active )
+                THEN
+                    action_stmts = array_append(
+                        action_stmts,
+                        format(
+                            'ALTER TABLE %I.%I DETACH PARTITION %I.%I ;',
+                            OLD.schema_name,
+                            OLD.partition_of_table_name,
+                            OLD.schema_name,
+                            OLD.table_name
+                        )
+                    );
+                    messages = array_append(
+                        messages,
+                        format(
+                            'DETACH PARTITION %I.%I FROM %I.%I',
+                            OLD.schema_name,
+                            OLD.table_name,
+                            OLD.schema_name,
+                            OLD.partition_of_table_name
+                        )
+                    );
+                END IF;
+
+                action_stmts = array_append(
+                    action_stmts,
+                    format(
+                        'TRUNCATE TABLE %I.%I ;', OLD.schema_name, OLD.table_name
+                    )
+                );
+                messages = array_append(messages, format('TRUNCATE TABLE %I.%I', OLD.schema_name, OLD.table_name));
+
+                action_stmts = array_append(
+                    action_stmts,
+                    format(
+                        'DROP TABLE IF EXISTS %I.%I ;', OLD.schema_name, OLD.table_name
+                    )
+                );
+                messages = array_append(messages, format('DROP TABLE IF EXISTS %I.%I', OLD.schema_name, OLD.table_name));
+            ELSE
+                RAISE NOTICE 'Table %.% does not exist. No partition actions taken', OLD.schema_name, OLD.table_name;
+            END IF;
+        ELSIF ( TG_OP = 'UPDATE' )
+        THEN
+            EXECUTE
+             format(
+    '
+    SELECT relispartition
+      FROM pg_class
+     WHERE oid = ''%I.%I''::regclass ;
+    ',
+                OLD.schema_name,
+                OLD.table_name
+             )
+               INTO partition_attached;
+
+            IF OLD.partition_of_table_name != NEW.partition_of_table_name
+            THEN
+                action_stmts = array_append(
+                    action_stmts,
+                    format(
+                        'ALTER TABLE IF EXISTS %I.%I RENAME TO %I ;',
+                        OLD.schema_name,
+                        OLD.partition_of_table_name,
+                        NEW.partition_of_table_name
+                    )
+                );
+                messages = array_append(
+                    messages,
+                    format(
+                        'RENAME TABLE %I.%I to %I',
+                        OLD.schema_name,
+                        OLD.partition_of_table_name,
+                        NEW.partition_of_table_name
+                    )
+                );
+            END IF;
+
+            IF OLD.table_name != NEW.table_name
+            THEN
+                action_stmts = array_append(
+                    action_stmts,
+                    format(
+                        'ALTER TABLE IF EXISTS %I.%I RENAME TO %I ;',
+                        OLD.schema_name,
+                        OLD.table_name,
+                        NEW.table_name
+                    )
+                );
+                messages = array_append(
+                    messages,
+                    format(
+                        'RENAME TABLE %I.%I to %I',
+                        OLD.schema_name,
+                        OLD.table_name,
+                        NEW.table_name
+                    )
+                );
+            END IF;
+
+            IF ((OLD.active AND NOT NEW.active) OR
+                (OLD.partition_parameters != NEW.partition_parameters)) AND
+               partition_attached IS DISTINCT FROM false
+            THEN
+                partition_attached = false;
+
+                action_stmts = array_append(
+                    action_stmts,
+                    format(
+                        'ALTER TABLE IF EXISTS %I.%I DETACH PARTITION %I.%I ;',
+                        OLD.schema_name,
+                        NEW.partition_of_table_name,
+                        OLD.schema_name,
+                        NEW.table_name
+                    )
+                );
+                messages = array_append(
+                    messages,
+                    format('DETACH PARTITION %I.%I FROM %I.%I',
+                        OLD.schema_name,
+                        NEW.table_name,
+                        OLD.schema_name,
+                        NEW.partition_of_table_name
+                    )
+                );
+            END IF;
+
+            IF ((NEW.active AND NOT OLD.active) OR
+                (OLD.partition_parameters != NEW.partition_parameters)) AND
+               partition_attached IS DISTINCT FROM true
+            THEN
+                partition_attached = true;
+
+                action_stmt = format(
+                    'ALTER TABLE IF EXISTS %I.%I ATTACH PARTITION %I.%I ',
+                    OLD.schema_name,
+                    NEW.partition_of_table_name,
+                    OLD.schema_name,
+                    NEW.table_name
+                );
+                message_text = format(
+                    'ATTACH PARITITION %I.%I TO %I.%I ',
+                    OLD.schema_name,
+                    NEW.table_name,
+                    OLD.schema_name,
+                    NEW.partition_of_table_name
+                );
+
+                IF ( (NEW.partition_parameters->>'default') = 'true' )
+                THEN
+                    action_stmts = array_append(
+                        action_stmts,
+                        action_stmt || 'DEFAULT ;'
+                    );
+                    messages = array_append(
+                        messages,
+                        message_text || 'AS DEFAULT PARITION'
+                    );
+                ELSE
+                    EXECUTE format(
+                        '
+    select format_type(
+        (
+            select atttypid
+              from pg_attribute
+             where attrelid = %L::regclass
+               and attname = %L
+        ),
+        null
+    );
+    ',
+                        quote_ident(NEW.schema_name) || '.' || quote_ident(NEW.partition_of_table_name),
+                        NEW.partition_col
+                    )
+                       INTO col_type_name;
+                    IF col_type_name != 'char' AND col_type_name ~ '^char'
+                    THEN
+                        col_type_name = 'text';
+                    END IF;
+
+                    n_partition_type = lower(NEW.partition_type);
+                    IF n_partition_type = 'range'
+                    THEN
+                        action_stmt_2 = format(
+                            'FOR VALUES FROM ( %L::%I ) TO ( %L::%I ) ',
+                            NEW.partition_parameters->>'from',
+                            col_type_name,
+                            NEW.partition_parameters->>'to',
+                            col_type_name
+                        );
+                    ELSIF n_partition_type = 'list'
+                    THEN
+                        FOREACH item IN ARRAY (string_to_array(NEW.partition_parameters->>'in', ',')::text[])
+                        LOOP
+                            action_items = array_append(
+                                action_items,
+                                format('%L::%I', item, col_type_name)
+                            );
+                        END LOOP;
+                        action_stmt_2 = format(
+                            'FOR VALUES IN ( %s ) ',
+                            array_to_string(action_items, ', ')
+                        );
+                    ELSE
+                        RAISE EXCEPTION 'Only ''range'' and ''list'' partition types are currently supported';
+                    END IF;
+                    action_stmts = array_append(action_stmts, action_stmt || action_stmt_2);
+                    messages = array_append(messages, message_text || action_stmt_2);
+                END IF;
+            END IF;
+        ELSIF ( TG_OP = 'INSERT' )
+        THEN
+            action_stmt = format(
+                'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.%I ',
+                NEW.schema_name,
+                NEW.table_name,
+                NEW.schema_name,
+                NEW.partition_of_table_name
+            );
+            message_text = format(
+                'CREATING NEW PARTITION %I.%I FOR %I.%I ',
+                NEW.schema_name,
+                NEW.table_name,
+                NEW.schema_name,
+                NEW.partition_of_table_name
+            );
+            IF ( (NEW.partition_parameters->>'default')::boolean )
+            THEN
+                action_stmts = array_append(
+                    action_stmts,
+                    action_stmt || 'DEFAULT '
+                );
+                messages = array_append(
+                    messages,
+                    message_text || 'AS DEFAULT PARITION'
+                );
+            ELSE
+                EXECUTE format(
+                            '
+    select format_type(atttypid, null)
+      from pg_attribute
+     where attrelid = %L::regclass
+       and attname = %L ;
+    ',
+                    quote_ident(NEW.schema_name) || '.' || quote_ident(NEW.partition_of_table_name),
+                    NEW.partition_col
+                )
+                   INTO col_type_name;
+                IF col_type_name != 'char' AND col_type_name ~ '^char'
+                THEN
+                    col_type_name = 'text';
+                END IF;
+
+                n_partition_type = lower(NEW.partition_type);
+                IF n_partition_type = 'range'
+                THEN
+                    action_stmt_2 = format(
+                        'FOR VALUES FROM ( %L::%I ) TO ( %L::%I ) ',
+                        NEW.partition_parameters->>'from',
+                        col_type_name,
+                        NEW.partition_parameters->>'to',
+                        col_type_name
+                    );
+                ELSIF n_partition_type = 'list'
+                THEN
+                    FOREACH item IN ARRAY (string_to_array(NEW.partition_parameters->>'in', ',')::text[])
+                    LOOP
+                        action_items = array_append(
+                            action_items,
+                            format('%L::%I', item, col_type_name)
+                        );
+                    END LOOP;
+                    action_stmt_2 = format(
+                        'FOR VALUES IN ( %s ) ',
+                        array_to_string(action_items, ', ')
+                    );
+                ELSE
+                    RAISE EXCEPTION 'Only ''range'' and ''list'' partition types are currently supported';
+                END IF;
+
+                IF nullif(NEW.subpartition_col, '') IS NOT NULL AND
+                   nullif(NEW.subpartition_type, '') IS NOT NULL
+                THEN
+                    action_stmt_2 = action_stmt_2 ||
+                                    format(
+                                        'PARTITION BY %s ( %I ) ',
+                                        NEW.subpartition_type,
+                                        NEW.subpartition_col
+                                    );
+                END IF;
+
+                action_stmts = array_append(action_stmts, action_stmt || action_stmt_2 || ' ;');
+                messages = array_append(messages, message_text || action_stmt_2);
+            END IF;
+        ELSE
+            RAISE EXCEPTION 'Unhandled trigger operation %', TG_OP;
+        END IF;
+
+        /* Execute the action statements we've queued */
+        total_actions = cardinality(action_stmts);
+        LOOP
+            EXIT WHEN action_ix > total_actions;
+
+            RAISE INFO '%', messages[action_ix];
+            EXECUTE action_stmts[action_ix];
+
+            action_ix = action_ix + 1;
+        END LOOP;
+
+        RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql;
+  partitioned_tables_active_trigger.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+
+    DROP TRIGGER IF EXISTS tr_attach_date_range_partition ON partitioned_tables;
+    CREATE TRIGGER tr_attach_date_range_partition
+     AFTER UPDATE OF active
+        ON partitioned_tables
+       FOR EACH ROW EXECUTE FUNCTION public.trfn_attach_date_range_partition();
+  partitioned_tables_active_trigger_function.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+
+    DROP FUNCTION IF EXISTS public.trfn_attach_date_range_partition();
+    CREATE OR REPLACE FUNCTION public.trfn_attach_date_range_partition() RETURNS TRIGGER AS $$
+    DECLARE
+        alter_stmt text = '';
+        msg text = '';
+    BEGIN
+        IF NEW.active != OLD.active
+        THEN
+            IF NEW.active = false
+            THEN
+                alter_stmt = 'ALTER TABLE ' ||
+                            quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.partition_of_table_name) ||
+                            ' DETACH PARTITION ' ||
+                            quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.table_name)
+                            || ' ;';
+                msg = 'DETACH PARTITION ' ||
+                    quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.table_name);
+            ELSE
+                alter_stmt = 'ALTER TABLE ' ||
+                            quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.partition_of_table_name) ||
+                            ' ATTACH PARTITION ' ||
+                            quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.table_name) || ' ';
+                IF ( (NEW.partition_parameters->>'default')::boolean )
+                THEN
+                    alter_stmt = alter_stmt || 'DEFAULT ;';
+                    msg = 'DEFAULT';
+                ELSE
+                    alter_stmt = alter_stmt || 'FOR VALUES FROM ( ' ||
+                                    quote_literal(NEW.partition_parameters->>'from') || '::date ) TO (' ||
+                                    quote_literal(NEW.partition_parameters->>'to') || '::date ) ;';
+                    msg = 'FOR VALUES FROM ( ' ||
+                        quote_literal(NEW.partition_parameters->>'from') || '::date ) TO (' ||
+                        quote_literal(NEW.partition_parameters->>'to') || '::date )';
+                END IF;
+                msg = 'ATTACH PARTITION ' ||
+                    quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.table_name) ||
+                    ' ' || msg;
+            END IF;
+
+            RAISE NOTICE 'ALTER TABLE %.% : %',
+                         quote_ident(NEW.schema_name), quote_ident(NEW.partition_of_table_name), msg;
+            EXECUTE alter_stmt;
+        END IF;
+
+        RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql;
+  partitioned_tables_manage_trigger.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+
+    DROP TRIGGER IF EXISTS tr_manage_date_range_partition ON partitioned_tables;
+    CREATE TRIGGER tr_manage_date_range_partition
+     AFTER INSERT
+        OR DELETE
+        OR UPDATE OF partition_parameters
+        ON partitioned_tables
+       FOR EACH ROW EXECUTE FUNCTION public.trfn_manage_date_range_partition();
+  partitioned_tables_manage_trigger_function.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+
+    DROP FUNCTION IF EXISTS public.trfn_manage_date_range_partition();
+    CREATE OR REPLACE FUNCTION public.trfn_manage_date_range_partition() RETURNS TRIGGER AS $$
+    DECLARE
+        alter_stmt text = '';
+        action_stmt text = '';
+        alter_msg text = '';
+        action_msg text = '';
+        table_name text = '';
+    BEGIN
+        IF ( TG_OP = 'DELETE' )
+        THEN
+            IF ( OLD.active )
+            THEN
+                alter_stmt = 'ALTER TABLE ' ||
+                            quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.partition_of_table_name) ||
+                            ' DETACH PARTITION ' ||
+                            quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.table_name) ||
+                            ' ;';
+            END IF;
+            action_stmt = 'DROP TABLE IF EXISTS ' || quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.table_name) || ' ;';
+            table_name = quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.partition_of_table_name);
+            alter_msg = 'DROP PARTITION ' || quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.table_name);
+        ELSIF ( TG_OP = 'UPDATE' )
+        THEN
+            /* If the partition was active, then detach it */
+            if ( OLD.active )
+            THEN
+                alter_stmt = 'ALTER TABLE ' ||
+                            quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.partition_of_table_name) ||
+                            ' DETACH PARTITION ' ||
+                            quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.table_name)
+                            || ' ;';
+            END IF;
+
+            /* If we are going to active or are still active, then attach the partition */
+            if ( NEW.active )
+            THEN
+                action_stmt = 'ALTER TABLE ' ||
+                                quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.partition_of_table_name) ||
+                                ' ATTACH PARTITION ' ||
+                                quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.table_name) || ' ';
+                IF ( (NEW.partition_parameters->>'default') = 'true' )
+                THEN
+                    action_stmt = action_stmt || 'DEFAULT ;';
+                    action_msg = 'DEFAULT';
+                ELSE
+                    action_stmt = action_stmt || 'FOR VALUES FROM ( ' ||
+                                quote_literal(NEW.partition_parameters->>'from') || '::date ) TO (' ||
+                                quote_literal(NEW.partition_parameters->>'to') || '::date ) ;';
+                    action_msg = 'FOR VALUES FROM ( ' ||
+                                quote_literal(NEW.partition_parameters->>'from') || '::date ) TO (' ||
+                                quote_literal(NEW.partition_parameters->>'to') || '::date )';
+                END IF;
+            END IF;
+
+            table_name = quote_ident(NEW.schema_name) || '.' || quote_ident(NEW.partition_of_table_name);
+            action_msg = 'ALTER PARTITION ' || quote_ident(NEW.schema_name) || '.' || quote_ident(NEW.table_name) ||
+                         ' ' || action_msg;
+        ELSIF ( TG_OP = 'INSERT' )
+        THEN
+            action_stmt = 'CREATE TABLE IF NOT EXISTS ' ||
+                          quote_ident(NEW.schema_name) || '.' || quote_ident(NEW.table_name) || ' ' ||
+                          'PARTITION OF ' ||
+                          quote_ident(NEW.schema_name) || '.' || quote_ident(NEW.partition_of_table_name) || ' ';
+            IF ( (NEW.partition_parameters->>'default')::boolean )
+            THEN
+                action_stmt = action_stmt || 'DEFAULT ;';
+                action_msg = 'DEFAULT';
+            ELSE
+                action_stmt = action_stmt || 'FOR VALUES FROM ( ' ||
+                              quote_literal(NEW.partition_parameters->>'from') || '::date ) TO (' ||
+                              quote_literal(NEW.partition_parameters->>'to') || '::date ) ;';
+                action_msg = 'FOR VALUES FROM ( ' ||
+                             quote_literal(NEW.partition_parameters->>'from') || '::date ) TO (' ||
+                             quote_literal(NEW.partition_parameters->>'to') || '::date )';
+            END IF;
+            action_msg = 'CREATE PARTITION ' || quote_ident(NEW.schema_name) || '.' || quote_ident(NEW.table_name) ||
+                         ' ' || action_msg;
+            table_name = quote_ident(NEW.schema_name) || '.' || quote_ident(NEW.partition_of_table_name);
+        ELSE
+            RAISE EXCEPTION 'Unhandled trigger operation %', TG_OP;
+        END IF;
+
+        IF ( alter_stmt != '' )
+        THEN
+            IF ( alter_msg != '' )
+            THEN
+                RAISE NOTICE 'ALTER TABLE % : %', table_name, alter_msg;
+            END IF;
+
+            EXECUTE alter_stmt;
+        END IF;
+
+        IF ( action_stmt != '' )
+        THEN
+            IF ( action_msg != '' )
+            THEN
+                RAISE NOTICE 'ALTER TABLE % : %', table_name, action_msg;
+            END IF;
+
+            EXECUTE action_stmt;
+        END IF;
+
+        RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql;
+  presto_delete_trigger_func.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+    create or replace function public.tr_presto_delete_wrapper_log_action() returns trigger as $$
+    begin
+        if NEW.result_rows is null
+        then
+            execute 'delete from ' || quote_ident(TG_TABLE_SCHEMA) || '.' || quote_ident(NEW.table_name) || ' ' ||
+                    NEW.where_clause;
+            get diagnostics NEW.result_rows = row_count;
+        end if;
+
+        return NEW;
+    end;
+    $$ language plpgsql;
+  reapply_partitioned_tables_manage_trigger_function.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+
+    CREATE OR REPLACE FUNCTION public.trfn_manage_date_range_partition() RETURNS TRIGGER AS $$
+    DECLARE
+        alter_stmt text = '';
+        action_stmt text = '';
+        alter_msg text = '';
+        action_msg text = '';
+        table_name text = '';
+    BEGIN
+        IF ( TG_OP = 'DELETE' )
+        THEN
+            IF ( OLD.active )
+            THEN
+                alter_stmt = 'ALTER TABLE ' ||
+                            quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.partition_of_table_name) ||
+                            ' DETACH PARTITION ' ||
+                            quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.table_name) ||
+                            ' ;';
+            END IF;
+            action_stmt = 'DROP TABLE IF EXISTS ' || quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.table_name) || ' ;';
+            table_name = quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.partition_of_table_name);
+            alter_msg = 'DROP PARTITION ' || quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.table_name);
+        ELSIF ( TG_OP = 'UPDATE' )
+        THEN
+            /* If the partition was active, then detach it */
+            if ( OLD.active )
+            THEN
+                alter_stmt = 'ALTER TABLE ' ||
+                            quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.partition_of_table_name) ||
+                            ' DETACH PARTITION ' ||
+                            quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.table_name)
+                            || ' ;';
+            END IF;
+
+            /* If we are going to active or are still active, then attach the partition */
+            if ( NEW.active )
+            THEN
+                action_stmt = 'ALTER TABLE ' ||
+                                quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.partition_of_table_name) ||
+                                ' ATTACH PARTITION ' ||
+                                quote_ident(OLD.schema_name) || '.' || quote_ident(OLD.table_name) || ' ';
+                IF ( (NEW.partition_parameters->>'default') = 'true' )
+                THEN
+                    action_stmt = action_stmt || 'DEFAULT ;';
+                    action_msg = 'DEFAULT';
+                ELSE
+                    action_stmt = action_stmt || 'FOR VALUES FROM ( ' ||
+                                quote_literal(NEW.partition_parameters->>'from') || '::date ) TO (' ||
+                                quote_literal(NEW.partition_parameters->>'to') || '::date ) ;';
+                    action_msg = 'FOR VALUES FROM ( ' ||
+                                quote_literal(NEW.partition_parameters->>'from') || '::date ) TO (' ||
+                                quote_literal(NEW.partition_parameters->>'to') || '::date )';
+                END IF;
+            END IF;
+
+            table_name = quote_ident(NEW.schema_name) || '.' || quote_ident(NEW.partition_of_table_name);
+            action_msg = 'ALTER PARTITION ' || quote_ident(NEW.schema_name) || '.' || quote_ident(NEW.table_name) ||
+                         ' ' || action_msg;
+        ELSIF ( TG_OP = 'INSERT' )
+        THEN
+            action_stmt = 'CREATE TABLE IF NOT EXISTS ' ||
+                          quote_ident(NEW.schema_name) || '.' || quote_ident(NEW.table_name) || ' ' ||
+                          'PARTITION OF ' ||
+                          quote_ident(NEW.schema_name) || '.' || quote_ident(NEW.partition_of_table_name) || ' ';
+            IF ( (NEW.partition_parameters->>'default')::boolean )
+            THEN
+                action_stmt = action_stmt || 'DEFAULT ;';
+                action_msg = 'DEFAULT';
+            ELSE
+                action_stmt = action_stmt || 'FOR VALUES FROM ( ' ||
+                              quote_literal(NEW.partition_parameters->>'from') || '::date ) TO (' ||
+                              quote_literal(NEW.partition_parameters->>'to') || '::date ) ;';
+                action_msg = 'FOR VALUES FROM ( ' ||
+                             quote_literal(NEW.partition_parameters->>'from') || '::date ) TO (' ||
+                             quote_literal(NEW.partition_parameters->>'to') || '::date )';
+            END IF;
+            action_msg = 'CREATE PARTITION ' || quote_ident(NEW.schema_name) || '.' || quote_ident(NEW.table_name) ||
+                         ' ' || action_msg;
+            table_name = quote_ident(NEW.schema_name) || '.' || quote_ident(NEW.partition_of_table_name);
+        ELSE
+            RAISE EXCEPTION 'Unhandled trigger operation %', TG_OP;
+        END IF;
+
+        IF ( alter_stmt != '' )
+        THEN
+            IF ( alter_msg != '' )
+            THEN
+                RAISE NOTICE 'ALTER TABLE % : %', table_name, alter_msg;
+            END IF;
+
+            EXECUTE alter_stmt;
+        END IF;
+
+        IF ( action_stmt != '' )
+        THEN
+            IF ( action_msg != '' )
+            THEN
+                RAISE NOTICE 'ALTER TABLE % : %', table_name, action_msg;
+            END IF;
+
+            EXECUTE action_stmt;
+        END IF;
+
+        RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql;
+  scan_date_partitions.sql: |
+    --
+    -- Copyright 2021 Red Hat Inc.
+    -- SPDX-License-Identifier: Apache-2.0
+    --
+    -- Function to return table partition start bounds from scanning another table for partition key values.
+    -- Args:
+    --   check_table (text)      : Name of the table to check for partition start bounds
+    --   check_col (text)        : Name of the column that holds the date values to check
+    --   schema (text)           : Schema of the partitioned table
+    --   parttioned_table (text) : Name of the partitioned table within the schema
+    DROP FUNCTION IF EXISTS public.scan_for_date_partitions(text, text, text, text);
+    CREATE OR REPLACE FUNCTION public.scan_for_date_partitions(
+        check_table text,
+        check_col text,
+        schema text,
+        partitioned_table text
+    )
+    RETURNS TABLE (partition_start date)
+    AS $$
+    DECLARE
+        rec record;
+        table_parts text[];
+        check_table_name text;
+        partition_name text  = '';
+        check_stmt text = '';
+    BEGIN
+        table_parts = string_to_array(check_table, '.');
+        IF ( cardinality(table_parts) > 1 )
+        THEN
+            check_table_name = quote_ident(table_parts[1]) || '.'::text || quote_ident(table_parts[2]);
+        ELSE
+            check_table_name = quote_ident(table_parts[1]);
+        END IF;
+
+        check_stmt = 'WITH distinct_date_key as (' ||
+                        'SELECT DISTINCT ' ||
+                        '       date_trunc(''month'', ' || quote_ident(check_col) || ')::date as date_val,' ||
+                        '       to_char(' || quote_ident(check_col) || ', ''YYYY-MM-01'')::text as date_key' ||
+                        '  FROM ' || check_table_name || ' ' ||
+                        ') ' ||
+                        'SELECT ddk.date_val as partition_start ' ||
+                        '  FROM distinct_date_key as ddk ' ||
+                        ' WHERE NOT EXISTS (SELECT 1 ' ||
+                        '                     FROM ' ||
+                                                quote_ident(schema) || '."partitioned_tables" ' ||
+                        '                    WHERE schema_name = ' || quote_literal(schema) ||
+                        '                      AND partition_of_table_name = ' || quote_literal(partitioned_table) ||
+                        '                      AND partition_type = ''range'' ' ||
+                        '                      AND ddk.date_key = (partition_parameters->>''from'') ) ;';
+        RETURN QUERY EXECUTE check_stmt;
+    END;
+    $$
+    LANGUAGE plpgsql;
+kind: ConfigMap
+metadata:
+  labels:
+    io.kompose.service: koku-server
+  name: koku-server-cm2
