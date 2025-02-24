@@ -451,7 +451,7 @@ services:
 
   db:
     container_name: koku-db
-    image: koku-db:14
+    image: public.ecr.aws/v0r6c2e2/koku-db:14
     build:
       context: dev/containers/postgresql
       args:
@@ -561,6 +561,7 @@ services:
 
   grafana:
     container_name: koku_grafana
+    image: public.ecr.aws/v0r6c2e2/koku-grafana:latest
     build:
         context: grafana
         dockerfile: Dockerfile-grafana
