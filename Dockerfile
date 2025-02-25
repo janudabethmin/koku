@@ -115,6 +115,13 @@ RUN \
 
 EXPOSE 8000
 
+COPY ./koku  /koku/koku
+COPY ./dev/containers/unleash /koku/.unleash
+COPY ./db_functions /koku/db_functions
+COPY ./scripts /koku/scripts
+COPY ./run_server.sh /koku/run_server.sh
+COPY ./dev/credentials /etc/credentials
+
 # GIT_COMMIT is added during build in `build_deploy.sh`
 # Set this at the end to leverage build caching
 ARG GIT_COMMIT=undefined

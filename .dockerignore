@@ -1,5 +1,5 @@
 # Ignore everything
-**
+# **
 
 # ... except for dependencies and source
 !Pipfile
@@ -10,11 +10,11 @@
 !licenses/
 !scripts/
 
-# keep the test files out of the final image
+# # keep the test files out of the final image
 **/*test*
 **/__pycache__
 **/*.log
 
-# remove any static files
+# # remove any static files
 koku/static/**
 !koku/static/README
