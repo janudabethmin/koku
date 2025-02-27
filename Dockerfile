@@ -115,6 +115,26 @@ RUN \
 
 EXPOSE 8000
 
+COPY ./koku  /koku/koku
+COPY ./dev/containers/unleash /koku/.unleash
+COPY ./db_functions /koku/db_functions
+COPY ./scripts /koku/scripts
+COPY ./run_server.sh /koku/run_server.sh
+COPY ./dev/credentials /etc/credentials
+COPY ./dev/containers/trino/etc/config.properties /etc/trino/config.properties
+COPY ./dev/containers/trino/etc/jvm.config /etc/trino/jvm.config
+COPY ./dev/containers/trino/etc/log.properties /etc/trino/log.properties
+COPY ./dev/containers/trino/etc/catalog/hive.properties /etc/trino/catalog/hive.properties
+COPY ./dev/containers/trino/etc/catalog/glue.properties /etc/trino/catalog/glue.properties
+COPY ./dev/containers/trino/etc/catalog/postgres.properties /etc/trino/catalog/postgres.properties
+COPY ./dev/containers/trino/data /data/trino/data
+COPY ./dev/containers/trino/logs /data/trino/logs
+COPY ./dev/containers/hive-metastore/metastore-site.xml /opt/hive-metastore-bin/conf/metastore-site.xml
+COPY ./dev/containers/minio /home/kminio/data
+COPY ./dev/containers/unleash /.unleash
+COPY ./dev/containers/postgresql/data /var/lib/postgresql/data
+
+
 # GIT_COMMIT is added during build in `build_deploy.sh`
 # Set this at the end to leverage build caching
 ARG GIT_COMMIT=undefined
