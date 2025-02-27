@@ -132,6 +132,8 @@ COPY ./dev/containers/trino/logs /data/trino/logs
 COPY ./dev/containers/hive-metastore/metastore-site.xml /opt/hive-metastore-bin/conf/metastore-site.xml
 COPY ./dev/containers/minio /home/kminio/data
 COPY ./dev/containers/unleash /.unleash
+COPY ./dev/containers/postgresql/data /var/lib/postgresql/data
+
 
 # GIT_COMMIT is added during build in `build_deploy.sh`
 # Set this at the end to leverage build caching
